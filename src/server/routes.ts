@@ -16,6 +16,38 @@ import type { OpenAIChatRequest } from "../types/openai.js";
 import type { ClaudeCliAssistant, ClaudeCliResult, ClaudeCliStreamEvent } from "../types/claude-cli.js";
 
 /**
+ * Concurrency queue — limits parallel Claude CLI subprocesses.
+ * Claude Max subscriptions can get rate-limited with too many concurrent sessions.
+ */
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || "2", 10);
+let activeCount = 0;
+const waitQueue: Array<() => void> = [];
+
+function acquireSlot(): Promise<void> {
+  if (activeCount < MAX_CONCURRENT) {
+    activeCount++;
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    waitQueue.push(resolve);
+  });
+}
+
+function releaseSlot(): void {
+  if (waitQueue.length > 0) {
+    const next = waitQueue.shift()!;
+    next();
+  } else {
+    activeCount--;
+  }
+}
+
+/** Expose queue stats for /health */
+export function getQueueStats() {
+  return { active: activeCount, queued: waitQueue.length, max: MAX_CONCURRENT };
+}
+
+/**
  * Handle POST /v1/chat/completions
  *
  * Main endpoint for chat requests, supports both streaming and non-streaming
@@ -41,14 +73,27 @@ export async function handleChatCompletions(
       return;
     }
 
+    // Wait for a concurrency slot
+    const queuePos = waitQueue.length;
+    if (activeCount >= MAX_CONCURRENT) {
+      console.error(`[Queue] Request ${requestId} queued (position ${queuePos + 1}, active: ${activeCount}/${MAX_CONCURRENT})`);
+    }
+    await acquireSlot();
+    console.error(`[Queue] Request ${requestId} acquired slot (active: ${activeCount}/${MAX_CONCURRENT}, queued: ${waitQueue.length})`);
+
     // Convert to CLI input format
     const cliInput = openaiToCli(body);
     const subprocess = new ClaudeSubprocess();
 
-    if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
-    } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+    try {
+      if (stream) {
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
+      } else {
+        await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+      }
+    } finally {
+      releaseSlot();
+      console.error(`[Queue] Request ${requestId} released slot (active: ${activeCount}/${MAX_CONCURRENT}, queued: ${waitQueue.length})`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -285,9 +330,11 @@ export function handleModels(_req: Request, res: Response): void {
  * Health check endpoint
  */
 export function handleHealth(_req: Request, res: Response): void {
+  const queue = getQueueStats();
   res.json({
     status: "ok",
     provider: "claude-code-cli",
     timestamp: new Date().toISOString(),
+    queue,
   });
 }
